@@ -36,7 +36,8 @@ future upstream io_uring DMA-BUF path.
 ## OpenDS backend architecture
 
 Solid green blocks are parts of the implemented OpenDS backend paths. Dashed
-orange blocks show the proposed upstream path.
+orange blocks show the proposed upstream path. Arrows show the read direction
+unless a path is explicitly labelled as writes.
 
 ```mermaid
 flowchart LR
@@ -50,12 +51,13 @@ flowchart LR
     ref --> posix["POSIX I/O and host staging"]
     gds --> cufile["NVIDIA cuFile"]
     aisio --> userStack["HOMI, xNVMe and uPCIe (direct reads)"]
-    aisio --> stagedWrites["pwrite and host staging (writes)"]
+    aisio --> stagedWrites["CPU copy to host buffer and pwrite (writes)"]
     importer["dmabuf_import address setup"] --> userStack
     uring -.-> kernelStack["Linux filesystem, block and NVMe"]
 
     posix --> hostPath["Host memory and GPU copy"]
-    stagedWrites --> hostPath
+    stagedWrites <---|"GPU write data"| gpu
+    stagedWrites --> writeStack["XFS, qublk, HOMI, uPCIe and NVMe"]
     cufile --> p2pPath["NVMe P2P DMA"]
     userStack --> p2pPath
     kernelStack -.-> p2pPath
@@ -64,7 +66,7 @@ flowchart LR
 
     classDef current fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
     classDef future fill:#fff3e0,stroke:#ef6c00,color:#e65100,stroke-dasharray:5 5
-    class ref,gds,aisio,posix,cufile,userStack,stagedWrites,importer,hostPath,p2pPath current
+    class ref,gds,aisio,posix,cufile,userStack,stagedWrites,writeStack,importer,hostPath,p2pPath current
     class uring,kernelStack future
 ```
 
