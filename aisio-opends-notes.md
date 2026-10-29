@@ -33,41 +33,22 @@ backend determines how file data moves between storage and accelerator memory:
 through ordinary POSIX I/O, NVIDIA GDS, the current AiSIO/uPCIe path, or a
 future upstream io_uring DMA-BUF path.
 
-## OpenDS backend architecture
+## OpenDS backends
 
-Solid green blocks are parts of the implemented OpenDS backend paths. Dashed
-orange blocks show the proposed upstream path. Arrows show the read direction
-unless a path is explicitly labelled as writes.
+OpenDS routes I/O to one of several backends. This diagram shows only which
+stack each backend uses; the data paths are shown in
+[Current AiSIO/OpenDS data paths](#current-aisioopends-data-paths).
 
 ```mermaid
 flowchart LR
     app["Application"] --> api["OpenDS API"]
+    api --> ref["Reference backend"] --> posix["POSIX I/O via host memory"]
+    api --> gds["GDS backend"] --> cufile["NVIDIA cuFile"]
+    api --> aisio["AiSIO backend"] --> user["HOMI + xNVMe/uPCIe<br/>(userspace NVMe driver)"]
+    api -.-> uring["io_uring DMA-BUF backend<br/>(possible, not implemented)"] -.-> kern["Linux block/NVMe<br/>(kernel NVMe driver)"]
 
-    api --> ref["Reference backend (current)"]
-    api --> gds["GDS backend (current)"]
-    api --> aisio["AiSIO backend (current)"]
-    api -.-> uring["io_uring DMA-BUF backend (future)"]
-
-    ref --> posix["POSIX I/O and host staging"]
-    gds --> cufile["NVIDIA cuFile"]
-    aisio --> userStack["HOMI, xNVMe and uPCIe (direct reads)"]
-    aisio --> stagedWrites["CPU copy to host buffer and pwrite (writes)"]
-    importer["dmabuf_import address setup"] --> userStack
-    uring -.-> kernelStack["Linux filesystem, block and NVMe"]
-
-    posix --> hostPath["Host memory and GPU copy"]
-    stagedWrites <---|"GPU write data"| gpu
-    stagedWrites --> writeStack["XFS, qublk, HOMI, uPCIe and NVMe"]
-    cufile --> p2pPath["NVMe P2P DMA"]
-    userStack --> p2pPath
-    kernelStack -.-> p2pPath
-    p2pPath --> gpu["GPU memory"]
-    hostPath --> gpu
-
-    classDef current fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
-    classDef future fill:#fff3e0,stroke:#ef6c00,color:#e65100,stroke-dasharray:5 5
-    class ref,gds,aisio,posix,cufile,userStack,stagedWrites,writeStack,importer,hostPath,p2pPath current
-    class uring,kernelStack future
+    classDef future stroke-dasharray:5 5
+    class uring,kern future
 ```
 
 ## Component summary
@@ -119,15 +100,9 @@ through separate SR-IOV functions.
 The current uPCIe path uses an out-of-tree module named `dmabuf_import`, exposed
 through `/dev/dmabuf_import`.
 
-The high-level flow is:
-
-```text
-GPU allocation
-    -> exported as a DMA-BUF fd
-    -> dmabuf_import attaches and maps it
-    -> userspace receives (dma_addr, length) tuples
-    -> uPCIe builds NVMe PRP/SGL entries from those addresses
-```
+It turns a GPU DMA-BUF fd into DMA addresses that userspace can put in NVMe
+commands. See the setup diagram under
+[Current AiSIO/OpenDS data paths](#current-aisioopends-data-paths).
 
 This resembles part of the upstream raw-block implementation, but the ownership
 boundary differs:
@@ -202,36 +177,55 @@ application
 
 This is a real read/write filesystem path, not merely a way to call FIEMAP.
 
-### Direct P2P reads
+In the diagrams below, thin arrows are control (commands, metadata) and thick
+arrows are data.
 
-For a direct OpenDS read:
+### Setup
 
-```text
-OpenDS
-    -> HOMI resolves current file extents (homic_get_extents(), FIEMAP)
-    -> file offset is translated to an NVMe LBA range
-    -> xNVMe/uPCIe submits the NVMe read (xnvme_nvm_read())
-    -> NVMe performs P2P DMA into GPU memory
+Done once per buffer or driver instance, before any I/O:
+
+```mermaid
+flowchart LR
+    gpu["GPU allocation<br/>(CUDA/HIP)"] --> fd["DMA-BUF fd"]
+    fd --> imp["dmabuf_import<br/>(out-of-tree kernel module)"]
+    imp --> addrs["(dma_addr, length) tuples<br/>returned to userspace"]
+    addrs --> upcie["xNVMe/uPCIe<br/>keeps them for PRP/SGL entries"]
+    homi["HOMI"] -->|"homic_attach_qpair()"| upcie
 ```
 
-HOMI participates in setup and metadata resolution. Once the client has a queue
-and the mapping, the direct data request is submitted through xNVMe/uPCIe rather
-than forwarded through HOMI like a blk-mq request.
+`dmabuf_import` exists because the NVMe driver is in userspace: it needs bus
+addresses for GPU memory to put into NVMe commands. HOMI owns the controller
+and hands the client its NVMe queue pairs.
+
+### Direct P2P reads
+
+```mermaid
+flowchart LR
+    ods["OpenDS read<br/>(file, offset, len)"] -->|"homic_get_extents()"| homi["HOMI<br/>FIEMAP over qublk"]
+    homi -->|"LBA range"| ods
+    ods -->|"xnvme_nvm_read()"| upcie["xNVMe/uPCIe<br/>PRPs = GPU addresses"]
+    upcie -->|"NVMe read command"| ssd[("NVMe SSD")]
+    ssd ==>|"P2P DMA"| gpu["GPU memory"]
+```
+
+HOMI only resolves extents. The command goes straight from the client's queue
+to the SSD, and the data goes from the SSD to GPU memory without passing
+through host memory.
 
 ### Writes in the current OpenDS backend
 
 The current OpenDS AiSIO backend does not issue direct P2P NVMe writes from GPU
 memory. A write is staged into host memory and sent through `pwrite()`:
 
-```text
-GPU buffer
-    -> CPU copy to host buffer
-    -> pwrite()
-    -> XFS
-    -> block layer
-    -> qublk
-    -> HOMI/uPCIe
-    -> NVMe
+```mermaid
+flowchart LR
+    writeOp["OpenDS write"] -->|"copy, then pwrite()"| host
+    gpu["GPU memory"] ==>|"copy"| host["Host buffer"]
+    host ==>|"pwrite()"| xfs["XFS"]
+    xfs ==> qublk["block layer and qublk"]
+    qublk ==> upcie["HOMI and uPCIe"]
+    upcie ==> ssd[("NVMe SSD")]
+    writeOp -->|"homic_mark_dirty()"| dirty["Invalidate cached extents"]
 ```
 
 This lets XFS allocate blocks, update file size and extents, perform COW, and
@@ -247,13 +241,17 @@ implementation avoids that problem.
 
 The upstream path changes the infrastructure and controller owner:
 
-```text
-OpenDS
-    -> io_uring registered DMA-BUF
-    -> Linux block/NVMe stack
-    -> NVMe P2P DMA
-    -> GPU memory
+```mermaid
+flowchart LR
+    fd["GPU DMA-BUF fd"] -->|"register as fixed buffer"| uring["io_uring"]
+    uring -->|"kernel NVMe driver maps it;<br/>addresses stay in the kernel"| nvme["Linux filesystem/block<br/>or NVMe passthrough"]
+    ods["OpenDS read"] -->|"READ_FIXED or<br/>NVMe passthrough"| uring
+    nvme -->|"NVMe read command"| ssd[("NVMe SSD")]
+    ssd ==>|"P2P DMA"| gpu["GPU memory"]
 ```
+
+Compared with the AiSIO setup above, `dmabuf_import`, uPCIe and HOMI drop out:
+the kernel NVMe driver imports the DMA-BUF itself.
 
 Benefits include retaining normal kernel NVMe ownership, device management,
 timeouts, reset handling, and DMA-address isolation inside the kernel. It also
